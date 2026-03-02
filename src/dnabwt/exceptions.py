@@ -27,7 +27,7 @@ class SearchError(DNABWTError):
     """BWT search failed."""
 
 
-class InterruptedError(DNABWTError, KeyboardInterrupt):
+class InterruptedError(DNABWTError):
     """Operation interrupted by signal or callback."""
 
 

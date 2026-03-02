@@ -436,7 +436,7 @@ PyMODINIT_FUNC PyInit__core_native(void) {
     }
 
     g_core_error = PyErr_NewException("dnabwt._core_native.CoreError", PyExc_RuntimeError, NULL);
-    g_interrupted_error = PyErr_NewException("dnabwt._core_native.InterruptedError", PyExc_KeyboardInterrupt, NULL);
+    g_interrupted_error = PyErr_NewException("dnabwt._core_native.InterruptedError", g_core_error, NULL);
     if (g_core_error == NULL || g_interrupted_error == NULL) {
         Py_XDECREF(g_core_error);
         Py_XDECREF(g_interrupted_error);
