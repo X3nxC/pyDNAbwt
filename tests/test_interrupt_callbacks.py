@@ -4,6 +4,9 @@ import pytest
 
 import dnabwt._core_native as core
 
+LARGE_TEXT = "AGCT" * 5000 + "\n"
+LONG_PATTERN = "AGCT" * 4096
+
 
 def test_signal_callback_interrupts_transform() -> None:
     text = "AGCT" * 1024 + "\n"
@@ -17,7 +20,7 @@ def test_signal_callback_interrupts_transform() -> None:
 
 
 def test_signal_callback_interrupts_inverse() -> None:
-    text = "AGCTAGCTAGCT\n"
+    text = LARGE_TEXT
     encoded = core.transform_from_text(text=text, progress_cb=None, signal_cb=lambda: 0)
 
     with pytest.raises(core.InterruptedError):
@@ -28,21 +31,24 @@ def test_signal_callback_interrupts_inverse() -> None:
         )
 
 
-def test_signal_callback_interrupts_search_bytes_mode() -> None:
-    text = "AGCT" * 2048 + "\n"
+def test_signal_callback_interrupts_search_index_build(tmp_path) -> None:
+    text = LARGE_TEXT
     encoded = core.transform_from_text(text=text, progress_cb=None, signal_cb=lambda: 0)
+    p = tmp_path / "idx.rbwt"
+    p.write_bytes(encoded)
 
     with pytest.raises(core.InterruptedError):
-        core.search_count(
-            data=encoded,
-            pattern="AGC",
+        core.build_search_index_from_encoded_file(
+            path=str(p),
+            block_size=128,
+            cache_count=2,
             progress_cb=None,
             signal_cb=lambda: 1,
         )
 
 
 def test_signal_callback_interrupts_search_index_mode(tmp_path) -> None:
-    text = "AGCT" * 1024 + "\n"
+    text = LARGE_TEXT
     encoded = core.transform_from_text(text=text, progress_cb=None, signal_cb=lambda: 0)
     p = tmp_path / "idx.rbwt"
     p.write_bytes(encoded)
@@ -51,7 +57,7 @@ def test_signal_callback_interrupts_search_index_mode(tmp_path) -> None:
     with pytest.raises(core.InterruptedError):
         core.search_with_index(
             index=index,
-            pattern="AGC",
+            pattern=LONG_PATTERN,
             progress_cb=None,
             signal_cb=lambda: 1,
         )
