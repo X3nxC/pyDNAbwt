@@ -1,7 +1,10 @@
 #include <string.h>
+#include <limits.h>
 
 #include "dna_rle.h"
 #include "../util/util.h"
+
+#define DNABWT_RLE_MAX_RUN ((size_t)1u << 27u)
 
 static int dnabwt_symbol_to_code(uint8_t symbol, uint8_t *code) {
     switch (symbol) {
@@ -17,24 +20,106 @@ static int dnabwt_symbol_to_code(uint8_t symbol, uint8_t *code) {
         case 'T':
             *code = 3u;
             return 1;
+        case 'N':
+            *code = 4u;
+            return 1;
+        case 0u:
+            *code = 5u;
+            return 1;
         default:
             return 0;
     }
 }
 
-static uint8_t dnabwt_code_to_symbol(uint8_t code) {
+static int dnabwt_code_to_symbol(uint8_t code, uint8_t *symbol) {
     switch (code) {
         case 0u:
-            return 'A';
+            *symbol = 'A';
+            return 1;
         case 1u:
-            return 'G';
+            *symbol = 'G';
+            return 1;
         case 2u:
-            return 'C';
+            *symbol = 'C';
+            return 1;
         case 3u:
-            return 'T';
+            *symbol = 'T';
+            return 1;
+        case 4u:
+            *symbol = 'N';
+            return 1;
+        case 5u:
+            *symbol = 0u;
+            return 1;
         default:
-            return 0u;
+            return 0;
     }
+}
+
+static size_t dnabwt_rle_bytes_for_run(size_t run) {
+    if (run <= (1u << 3u)) {
+        return 1u;
+    }
+    if (run <= (1u << 11u)) {
+        return 2u;
+    }
+    if (run <= (1u << 19u)) {
+        return 3u;
+    }
+    if (run <= DNABWT_RLE_MAX_RUN) {
+        return 4u;
+    }
+    return 0u;
+}
+
+static void dnabwt_rle_write_run(uint8_t code, size_t run, uint8_t *output, size_t *cursor) {
+    size_t bytes = dnabwt_rle_bytes_for_run(run);
+    size_t run_minus_one = run - 1u;
+    size_t j;
+
+    output[*cursor] = (uint8_t)((code << 5u) | ((uint8_t)(bytes - 1u) << 3u) | (uint8_t)(run_minus_one & 0x07u));
+    for (j = 1u; j < bytes; ++j) {
+        output[*cursor + j] = (uint8_t)((run_minus_one >> (3u + 8u * (j - 1u))) & 0xFFu);
+    }
+    *cursor += bytes;
+}
+
+static dnabwt_status_t dnabwt_rle_read_run(const uint8_t *input,
+                                           size_t input_len,
+                                           size_t *cursor,
+                                           uint8_t *symbol,
+                                           size_t *run_len) {
+    uint8_t b0;
+    uint8_t code;
+    size_t bytes;
+    size_t run_minus_one;
+    size_t j;
+
+    if (input == NULL || cursor == NULL || symbol == NULL || run_len == NULL) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+    if (*cursor >= input_len) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+
+    b0 = input[*cursor];
+    code = (uint8_t)(b0 >> 5u);
+    bytes = (size_t)(((b0 >> 3u) & 0x03u) + 1u);
+    if ((input_len - *cursor) < bytes) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+    if (!dnabwt_code_to_symbol(code, symbol)) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+
+    run_minus_one = (size_t)(b0 & 0x07u);
+    for (j = 1u; j < bytes; ++j) {
+        run_minus_one |= ((size_t)input[*cursor + j]) << (3u + 8u * (j - 1u));
+    }
+
+    *run_len = run_minus_one + 1u;
+    *cursor += bytes;
+    return DNABWT_STATUS_OK;
 }
 
 static dnabwt_status_t dnabwt_rle_encode_single(const uint8_t *input,
@@ -51,12 +136,11 @@ static dnabwt_status_t dnabwt_rle_encode_single(const uint8_t *input,
             return DNABWT_STATUS_INVALID_ARGUMENT;
         }
 
-        while (i + run < input_len && input[i + run] == input[i] && run < 64u) {
+        while (i + run < input_len && input[i + run] == input[i] && run < DNABWT_RLE_MAX_RUN) {
             ++run;
         }
 
-        output[*cursor] = (uint8_t)((code << 6u) | ((uint8_t)run - 1u));
-        *cursor += 1u;
+        dnabwt_rle_write_run(code, run, output, cursor);
         i += run;
     }
 
@@ -64,7 +148,10 @@ static dnabwt_status_t dnabwt_rle_encode_single(const uint8_t *input,
 }
 
 size_t dnabwt_rle_encoded_bound(size_t input_len) {
-    return input_len;
+    if (input_len > (SIZE_MAX / 4u)) {
+        return SIZE_MAX;
+    }
+    return input_len * 4u;
 }
 
 dnabwt_status_t dnabwt_rle_encode(const uint8_t *input,
@@ -144,8 +231,18 @@ dnabwt_status_t dnabwt_rle_decode(const uint8_t *input,
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
 
-    for (i = 0; i < input_len; ++i) {
-        total += (size_t)((input[i] & 0x3Fu) + 1u);
+    i = 0;
+    while (i < input_len) {
+        uint8_t symbol = 0u;
+        size_t run = 0u;
+        dnabwt_status_t status = dnabwt_rle_read_run(input, input_len, &i, &symbol, &run);
+        if (status != DNABWT_STATUS_OK) {
+            return status;
+        }
+        if (SIZE_MAX - total < run) {
+            return DNABWT_STATUS_INVALID_ARGUMENT;
+        }
+        total += run;
     }
 
     buf = (uint8_t *)dnabwt_malloc(total == 0 ? 1u : total);
@@ -153,13 +250,14 @@ dnabwt_status_t dnabwt_rle_decode(const uint8_t *input,
         return DNABWT_STATUS_NO_MEMORY;
     }
 
-    for (i = 0; i < input_len; ++i) {
-        uint8_t code = (uint8_t)(input[i] >> 6u);
-        uint8_t symbol = dnabwt_code_to_symbol(code);
-        size_t run = (size_t)((input[i] & 0x3Fu) + 1u);
-        if (symbol == 0u) {
+    i = 0;
+    while (i < input_len) {
+        uint8_t symbol = 0u;
+        size_t run = 0u;
+        dnabwt_status_t status = dnabwt_rle_read_run(input, input_len, &i, &symbol, &run);
+        if (status != DNABWT_STATUS_OK) {
             dnabwt_free(buf);
-            return DNABWT_STATUS_INVALID_ARGUMENT;
+            return status;
         }
         memset(buf + cursor, symbol, run);
         cursor += run;

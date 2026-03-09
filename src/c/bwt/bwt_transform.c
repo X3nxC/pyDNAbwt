@@ -4,7 +4,6 @@
 #include "bwt.h"
 #include "bwt_internal.h"
 #include "../code/dna_rle.h"
-#include "../code/sentinel.h"
 #include "../util/util.h"
 
 static const uint8_t *g_sa_text = NULL;
@@ -42,7 +41,7 @@ dnabwt_status_t dnabwt_validate_dna_text(const uint8_t *text, size_t len, size_t
     }
 
     for (i = 0; i < dna_len; ++i) {
-        if (text[i] != 'A' && text[i] != 'G' && text[i] != 'C' && text[i] != 'T') {
+        if (text[i] != 'A' && text[i] != 'G' && text[i] != 'C' && text[i] != 'T' && text[i] != 'N') {
             return DNABWT_STATUS_INVALID_ARGUMENT;
         }
     }
@@ -91,10 +90,8 @@ dnabwt_status_t dnabwt_transform_text(const uint8_t *input,
     uint8_t *text = NULL;
     size_t *sa = NULL;
     uint8_t *bwt = NULL;
-    size_t sentinel_index = 0;
     uint8_t *rle = NULL;
     size_t rle_len = 0;
-    uint8_t *packed = NULL;
     dnabwt_status_t status;
     size_t i;
 
@@ -141,9 +138,6 @@ dnabwt_status_t dnabwt_transform_text(const uint8_t *input,
     for (i = 0; i < n; ++i) {
         size_t pos = sa[i];
         bwt[i] = text[(pos + n - 1u) % n];
-        if (bwt[i] == 0u) {
-            sentinel_index = i;
-        }
 
         if ((i & 0x1FFFu) == 0 && dnabwt_progress_report(i, n) != 0) {
             status = DNABWT_STATUS_INTERRUPTED;
@@ -156,34 +150,14 @@ dnabwt_status_t dnabwt_transform_text(const uint8_t *input,
     }
     dnabwt_progress_report(n, n);
 
-    status = dnabwt_rle_encode_segments(
-        bwt,
-        sentinel_index,
-        bwt + sentinel_index + 1u,
-        n - sentinel_index - 1u,
-        &rle,
-        &rle_len);
+    status = dnabwt_rle_encode(bwt, n, &rle, &rle_len);
     if (status != DNABWT_STATUS_OK) {
         goto cleanup;
     }
 
-    packed = (uint8_t *)dnabwt_malloc(DNABWT_SENTINEL_HEADER_SIZE + rle_len);
-    if (packed == NULL) {
-        status = DNABWT_STATUS_NO_MEMORY;
-        goto cleanup;
-    }
-
-    status = dnabwt_sentinel_pack((uint64_t)sentinel_index, packed);
-    if (status != DNABWT_STATUS_OK) {
-        goto cleanup;
-    }
-    if (rle_len > 0) {
-        memcpy(packed + DNABWT_SENTINEL_HEADER_SIZE, rle, rle_len);
-    }
-
-    *output = packed;
-    *output_len = DNABWT_SENTINEL_HEADER_SIZE + rle_len;
-    packed = NULL;
+    *output = rle;
+    *output_len = rle_len;
+    rle = NULL;
     status = DNABWT_STATUS_OK;
 
 cleanup:
@@ -192,7 +166,6 @@ cleanup:
                dnabwt_status_message(status),
                (status == DNABWT_STATUS_OK) ? *output_len : 0u,
                dnabwt_mem_peak());
-    dnabwt_free(packed);
     dnabwt_free(rle);
     dnabwt_free(bwt);
     dnabwt_free(sa);

@@ -1,30 +1,41 @@
 #include <string.h>
+#include <limits.h>
 
 #include "bwt.h"
 #include "bwt_internal.h"
 #include "../code/dna_rle.h"
-#include "../code/sentinel.h"
 #include "../util/util.h"
 
-#define DNABWT_OCC_SLOT_COUNT 5u
+#define DNABWT_OCC_SLOT_COUNT 6u
 #define DNABWT_SLOT_SENTINEL 0u
 #define DNABWT_SLOT_A 1u
 #define DNABWT_SLOT_G 2u
 #define DNABWT_SLOT_C 3u
 #define DNABWT_SLOT_T 4u
+#define DNABWT_SLOT_N 5u
 
-static uint8_t dnabwt_rle_symbol_from_code(uint8_t code) {
+static int dnabwt_rle_symbol_from_code(uint8_t code, uint8_t *symbol) {
     switch (code) {
         case 0u:
-            return 'A';
+            *symbol = 'A';
+            return 1;
         case 1u:
-            return 'G';
+            *symbol = 'G';
+            return 1;
         case 2u:
-            return 'C';
+            *symbol = 'C';
+            return 1;
         case 3u:
-            return 'T';
+            *symbol = 'T';
+            return 1;
+        case 4u:
+            *symbol = 'N';
+            return 1;
+        case 5u:
+            *symbol = 0u;
+            return 1;
         default:
-            return 0u;
+            return 0;
     }
 }
 
@@ -40,6 +51,8 @@ static size_t dnabwt_occ_slot_for_symbol(uint8_t symbol) {
             return DNABWT_SLOT_C;
         case 'T':
             return DNABWT_SLOT_T;
+        case 'N':
+            return DNABWT_SLOT_N;
         default:
             return (size_t)-1;
     }
@@ -52,8 +65,14 @@ static dnabwt_status_t dnabwt_reader_read_u8(dnabwt_reader_t *reader, size_t off
 static dnabwt_status_t dnabwt_read_run_at(dnabwt_reader_t *reader,
                                           size_t run_off,
                                           uint8_t *symbol,
-                                          uint8_t *run_len) {
+                                          size_t *run_len,
+                                          size_t *run_bytes) {
     uint8_t b = 0;
+    uint8_t code;
+    size_t bytes;
+    size_t run_minus_one;
+    size_t j;
+    uint8_t s = 0u;
     dnabwt_status_t status;
 
     status = dnabwt_reader_read_u8(reader, run_off, &b);
@@ -61,11 +80,32 @@ static dnabwt_status_t dnabwt_read_run_at(dnabwt_reader_t *reader,
         return status;
     }
 
-    *symbol = dnabwt_rle_symbol_from_code((uint8_t)(b >> 6u));
-    if (*symbol == 0u) {
+    if (run_off >= reader->file_size) {
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
-    *run_len = (uint8_t)((b & 0x3Fu) + 1u);
+    code = (uint8_t)(b >> 5u);
+    bytes = (size_t)(((b >> 3u) & 0x03u) + 1u);
+    if ((reader->file_size - run_off) < bytes) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (!dnabwt_rle_symbol_from_code(code, &s)) {
+        return DNABWT_STATUS_INVALID_ARGUMENT;
+    }
+
+    run_minus_one = (size_t)(b & 0x07u);
+    for (j = 1u; j < bytes; ++j) {
+        uint8_t extra = 0u;
+        status = dnabwt_reader_read_u8(reader, run_off + j, &extra);
+        if (status != DNABWT_STATUS_OK) {
+            return status;
+        }
+        run_minus_one |= ((size_t)extra) << (3u + 8u * (j - 1u));
+    }
+
+    *symbol = s;
+    *run_len = run_minus_one + 1u;
+    *run_bytes = bytes;
     return DNABWT_STATUS_OK;
 }
 
@@ -106,10 +146,11 @@ static dnabwt_status_t dnabwt_search_decode_block(dnabwt_search_index_t *index,
     size_t target_len;
     size_t out = 0;
     size_t run_off;
-    uint8_t run_skip;
+    size_t run_skip;
     uint8_t run_valid;
     uint8_t run_symbol = 0u;
-    uint8_t run_len = 0u;
+    size_t run_len = 0u;
+    size_t run_bytes = 0u;
     dnabwt_status_t status = DNABWT_STATUS_OK;
 
     nav = &index->nav[blk];
@@ -124,27 +165,23 @@ static dnabwt_status_t dnabwt_search_decode_block(dnabwt_search_index_t *index,
     run_valid = nav->run_valid;
 
     if (run_valid) {
-        status = dnabwt_read_run_at(index->reader, run_off, &run_symbol, &run_len);
+        status = dnabwt_read_run_at(index->reader, run_off, &run_symbol, &run_len, &run_bytes);
         if (status != DNABWT_STATUS_OK || run_skip >= run_len) {
             return DNABWT_STATUS_INTERNAL_ERROR;
         }
     }
 
     while (out < target_len) {
-        size_t full_pos = start + out;
-
-        if (full_pos == index->sentinel_index) {
-            cache->data[out++] = 0u;
-            continue;
-        }
-
         if (!run_valid) {
             if (run_off >= index->reader->file_size) {
                 return DNABWT_STATUS_INTERNAL_ERROR;
             }
-            status = dnabwt_read_run_at(index->reader, run_off, &run_symbol, &run_len);
+            status = dnabwt_read_run_at(index->reader, run_off, &run_symbol, &run_len, &run_bytes);
             if (status != DNABWT_STATUS_OK) {
                 return status;
+            }
+            if (run_len == 0u) {
+                return DNABWT_STATUS_INTERNAL_ERROR;
             }
             run_skip = 0u;
             run_valid = 1u;
@@ -153,7 +190,7 @@ static dnabwt_status_t dnabwt_search_decode_block(dnabwt_search_index_t *index,
         cache->data[out++] = run_symbol;
         run_skip++;
         if (run_skip >= run_len) {
-            run_off++;
+            run_off += run_bytes;
             run_skip = 0u;
             run_valid = 0u;
         }
@@ -241,12 +278,11 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
                                                  dnabwt_search_index_t **index_out) {
     dnabwt_search_index_t *idx = NULL;
     dnabwt_reader_t *reader = NULL;
-    uint8_t header[DNABWT_SENTINEL_HEADER_SIZE];
-    uint64_t sentinel_idx64 = 0;
     size_t run_off;
     size_t decoded_len = 0;
     size_t n;
-    size_t sentinel_idx;
+    size_t sentinel_count = 0u;
+    size_t sentinel_idx = (size_t)-1;
     dnabwt_status_t status;
     size_t i;
 
@@ -274,38 +310,41 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
     if (status != DNABWT_STATUS_OK) {
         return status;
     }
-    if (reader->file_size < DNABWT_SENTINEL_HEADER_SIZE) {
+    if (reader->file_size == 0u) {
         dnabwt_reader_close(reader);
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
 
-    status = dnabwt_reader_read_at(reader, 0u, header, DNABWT_SENTINEL_HEADER_SIZE);
-    if (status != DNABWT_STATUS_OK) {
-        dnabwt_reader_close(reader);
-        return status;
-    }
-    status = dnabwt_sentinel_unpack(header, &sentinel_idx64);
-    if (status != DNABWT_STATUS_OK) {
-        dnabwt_reader_close(reader);
-        return status;
-    }
-
-    for (run_off = DNABWT_SENTINEL_HEADER_SIZE; run_off < reader->file_size; ++run_off) {
-        uint8_t b = 0;
-        status = dnabwt_reader_read_u8(reader, run_off, &b);
+    run_off = 0u;
+    while (run_off < reader->file_size) {
+        uint8_t run_symbol = 0u;
+        size_t run_len = 0u;
+        size_t run_bytes = 0u;
+        status = dnabwt_read_run_at(reader, run_off, &run_symbol, &run_len, &run_bytes);
         if (status != DNABWT_STATUS_OK) {
             dnabwt_reader_close(reader);
             return status;
         }
-        decoded_len += (size_t)((b & 0x3Fu) + 1u);
+        if (SIZE_MAX - decoded_len < run_len) {
+            dnabwt_reader_close(reader);
+            return DNABWT_STATUS_INVALID_ARGUMENT;
+        }
+        decoded_len += run_len;
+        if (run_symbol == 0u) {
+            if (SIZE_MAX - sentinel_count < run_len) {
+                dnabwt_reader_close(reader);
+                return DNABWT_STATUS_INVALID_ARGUMENT;
+            }
+            sentinel_count += run_len;
+        }
+        run_off += run_bytes;
     }
-
-    n = decoded_len + 1u;
-    sentinel_idx = (size_t)sentinel_idx64;
-    if (sentinel_idx >= n) {
+    if (run_off != reader->file_size || sentinel_count != 1u) {
         dnabwt_reader_close(reader);
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
+
+    n = decoded_len;
 
     idx = (dnabwt_search_index_t *)dnabwt_calloc(1u, sizeof(*idx));
     if (idx == NULL) {
@@ -315,7 +354,7 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
 
     idx->reader = reader;
     idx->n = n;
-    idx->sentinel_index = sentinel_idx;
+    idx->sentinel_index = 0u;
     idx->block_size = block_size;
     idx->nb = (n + block_size - 1u) / block_size;
     idx->cache_count = cache_count;
@@ -338,13 +377,14 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
     }
 
     {
-        size_t accum5[DNABWT_OCC_SLOT_COUNT] = {0u, 0u, 0u, 0u, 0u};
+        size_t accum5[DNABWT_OCC_SLOT_COUNT] = {0u, 0u, 0u, 0u, 0u, 0u};
         size_t full_pos;
         size_t blk = 0;
-        size_t cur_run_off = DNABWT_SENTINEL_HEADER_SIZE;
-        uint8_t cur_run_skip = 0u;
+        size_t cur_run_off = 0u;
+        size_t cur_run_skip = 0u;
         uint8_t cur_run_symbol = 0u;
-        uint8_t cur_run_len = 0u;
+        size_t cur_run_len = 0u;
+        size_t cur_run_bytes = 0u;
         uint8_t cur_run_valid = 0u;
 
         for (full_pos = 0; full_pos < n; ++full_pos) {
@@ -354,15 +394,14 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
                 idx->occ5[blk * DNABWT_OCC_SLOT_COUNT + DNABWT_SLOT_G] = accum5[DNABWT_SLOT_G];
                 idx->occ5[blk * DNABWT_OCC_SLOT_COUNT + DNABWT_SLOT_C] = accum5[DNABWT_SLOT_C];
                 idx->occ5[blk * DNABWT_OCC_SLOT_COUNT + DNABWT_SLOT_T] = accum5[DNABWT_SLOT_T];
+                idx->occ5[blk * DNABWT_OCC_SLOT_COUNT + DNABWT_SLOT_N] = accum5[DNABWT_SLOT_N];
                 idx->nav[blk].file_off = cur_run_off;
                 idx->nav[blk].inrun_skip = cur_run_skip;
                 idx->nav[blk].run_valid = cur_run_valid;
                 blk++;
             }
 
-            if (full_pos == sentinel_idx) {
-                accum5[DNABWT_SLOT_SENTINEL] += 1u;
-            } else {
+            {
                 size_t slot;
 
                 if (!cur_run_valid) {
@@ -370,7 +409,7 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
                         dnabwt_search_index_free(idx);
                         return DNABWT_STATUS_INTERNAL_ERROR;
                     }
-                    status = dnabwt_read_run_at(reader, cur_run_off, &cur_run_symbol, &cur_run_len);
+                    status = dnabwt_read_run_at(reader, cur_run_off, &cur_run_symbol, &cur_run_len, &cur_run_bytes);
                     if (status != DNABWT_STATUS_OK) {
                         dnabwt_search_index_free(idx);
                         return status;
@@ -385,10 +424,17 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
                     return DNABWT_STATUS_INTERNAL_ERROR;
                 }
                 accum5[slot] += 1u;
+                if (cur_run_symbol == 0u) {
+                    if (sentinel_idx != (size_t)-1) {
+                        dnabwt_search_index_free(idx);
+                        return DNABWT_STATUS_INVALID_ARGUMENT;
+                    }
+                    sentinel_idx = full_pos;
+                }
 
                 cur_run_skip++;
                 if (cur_run_skip >= cur_run_len) {
-                    cur_run_off++;
+                    cur_run_off += cur_run_bytes;
                     cur_run_skip = 0u;
                     cur_run_valid = 0u;
                 }
@@ -409,6 +455,12 @@ static dnabwt_status_t dnabwt_search_build_index(const char *encoded_path,
         idx->totals[(unsigned char)'G'] = accum5[DNABWT_SLOT_G];
         idx->totals[(unsigned char)'C'] = accum5[DNABWT_SLOT_C];
         idx->totals[(unsigned char)'T'] = accum5[DNABWT_SLOT_T];
+        idx->totals[(unsigned char)'N'] = accum5[DNABWT_SLOT_N];
+        if (sentinel_idx == (size_t)-1) {
+            dnabwt_search_index_free(idx);
+            return DNABWT_STATUS_INVALID_ARGUMENT;
+        }
+        idx->sentinel_index = sentinel_idx;
 
         {
             size_t total = 0;
@@ -446,7 +498,7 @@ static dnabwt_status_t dnabwt_search_count_with_index(dnabwt_search_index_t *ind
     }
 
     for (i = 0; i < pattern_len; ++i) {
-        if (pattern[i] != 'A' && pattern[i] != 'G' && pattern[i] != 'C' && pattern[i] != 'T') {
+        if (pattern[i] != 'A' && pattern[i] != 'G' && pattern[i] != 'C' && pattern[i] != 'T' && pattern[i] != 'N') {
             return DNABWT_STATUS_INVALID_ARGUMENT;
         }
     }
@@ -582,12 +634,10 @@ static dnabwt_status_t dnabwt_unpack_bwt(const uint8_t *encoded,
                                          size_t encoded_len,
                                          uint8_t **bwt_full,
                                          size_t *n_out) {
-    uint64_t sentinel_index64;
-    size_t sentinel_index;
     uint8_t *decoded = NULL;
     size_t decoded_len = 0;
-    size_t n;
-    uint8_t *full;
+    size_t sentinel_index = (size_t)-1;
+    size_t i;
     dnabwt_status_t status;
 
     if (encoded == NULL || bwt_full == NULL || n_out == NULL) {
@@ -596,47 +646,30 @@ static dnabwt_status_t dnabwt_unpack_bwt(const uint8_t *encoded,
     *bwt_full = NULL;
     *n_out = 0;
 
-    if (encoded_len < DNABWT_SENTINEL_HEADER_SIZE) {
+    status = dnabwt_rle_decode(encoded, encoded_len, &decoded, &decoded_len);
+    if (status != DNABWT_STATUS_OK) {
+        return status;
+    }
+    if (decoded_len == 0u) {
+        dnabwt_free(decoded);
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
-
-    status = dnabwt_sentinel_unpack(encoded, &sentinel_index64);
-    if (status != DNABWT_STATUS_OK) {
-        return status;
+    for (i = 0; i < decoded_len; ++i) {
+        if (decoded[i] == 0u) {
+            if (sentinel_index != (size_t)-1) {
+                dnabwt_free(decoded);
+                return DNABWT_STATUS_INVALID_ARGUMENT;
+            }
+            sentinel_index = i;
+        }
     }
-
-    status = dnabwt_rle_decode(encoded + DNABWT_SENTINEL_HEADER_SIZE,
-                               encoded_len - DNABWT_SENTINEL_HEADER_SIZE,
-                               &decoded,
-                               &decoded_len);
-    if (status != DNABWT_STATUS_OK) {
-        return status;
-    }
-
-    n = decoded_len + 1u;
-    sentinel_index = (size_t)sentinel_index64;
-    if (sentinel_index >= n) {
+    if (sentinel_index == (size_t)-1) {
         dnabwt_free(decoded);
         return DNABWT_STATUS_INVALID_ARGUMENT;
     }
 
-    full = (uint8_t *)dnabwt_malloc(n);
-    if (full == NULL) {
-        dnabwt_free(decoded);
-        return DNABWT_STATUS_NO_MEMORY;
-    }
-
-    if (sentinel_index > 0) {
-        memcpy(full, decoded, sentinel_index);
-    }
-    full[sentinel_index] = 0u;
-    if (decoded_len > sentinel_index) {
-        memcpy(full + sentinel_index + 1u, decoded + sentinel_index, decoded_len - sentinel_index);
-    }
-
-    dnabwt_free(decoded);
-    *bwt_full = full;
-    *n_out = n;
+    *bwt_full = decoded;
+    *n_out = decoded_len;
     return DNABWT_STATUS_OK;
 }
 
@@ -662,7 +695,7 @@ dnabwt_status_t dnabwt_search_count(const uint8_t *encoded_bwt,
     }
 
     for (i = 0; i < pattern_len; ++i) {
-        if (pattern[i] != 'A' && pattern[i] != 'G' && pattern[i] != 'C' && pattern[i] != 'T') {
+        if (pattern[i] != 'A' && pattern[i] != 'G' && pattern[i] != 'C' && pattern[i] != 'T' && pattern[i] != 'N') {
             dnabwt_log(DNABWT_LOG_WARN, "bwt search(bytes) invalid pattern");
             return DNABWT_STATUS_INVALID_ARGUMENT;
         }

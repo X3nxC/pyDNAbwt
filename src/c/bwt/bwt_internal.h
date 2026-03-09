@@ -20,9 +20,8 @@ typedef struct dnabwt_fm_index {
 
 typedef struct dnabwt_search_nav_entry {
     size_t file_off;
-    uint8_t inrun_skip;
+    size_t inrun_skip;
     uint8_t run_valid;
-    uint8_t _reserved[6];
 } dnabwt_search_nav_entry_t;
 
 typedef struct dnabwt_search_cache {
@@ -42,7 +41,7 @@ typedef struct dnabwt_search_index {
     uint64_t clock;
     size_t c_table[256];
     size_t totals[256];
-    size_t *occ5; /* nb x 5, order: $, A, G, C, T */
+    size_t *occ5; /* nb x 6, order: $, A, G, C, T, N */
     dnabwt_search_nav_entry_t *nav;
     dnabwt_search_cache_t *caches;
 } dnabwt_search_index_t;
